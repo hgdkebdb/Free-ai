@@ -27,12 +27,10 @@ enum SensorAccuracy: Equatable {
     case medium
     case high
 
-    // Нужно ли показать пользователю подсказку «покрутите восьмёркой»
     var needsCalibrationHint: Bool {
         self == .uncalibrated || self == .low
     }
 
-    // Текст подсказки (если нужен)
     var hintText: String? {
         guard needsCalibrationHint else { return nil }
         return "Покрутите телефон восьмёркой для настройки датчика"
@@ -44,6 +42,12 @@ enum SensorAccuracy: Equatable {
 // Отвечает за получение данных Device Motion (магнитометр + гироскоп),
 // сглаживание показаний, калибровку фона, расчёт AC-составляющей и
 // тактильную отдачу.
+//
+// Потокобезопасность: внутреннее состояние (backgroundNoise, sampleWindow,
+// filteredMagnitude, lastRawMagnitude) изменяется ИСКЛЮЧИТЕЛЬНО на
+// motionQueue (maxConcurrentOperationCount = 1 → сериализация). Команды
+// извне (calibrate, stopUpdates) ставятся в эту же очередь. Публикуемые
+// @Published свойства обновляются только из главного потока.
 final class MagnetometerManager: ObservableObject {
 
     // MARK: Публикуемые свойства (для UI)
@@ -63,31 +67,40 @@ final class MagnetometerManager: ObservableObject {
     // Точность калибровки магнитометра, сообщаемая системой.
     @Published var accuracy: SensorAccuracy = .uncalibrated
 
-    // MARK: Внутреннее состояние
+    // Телефон активно двигается — AC-замер недостоверен, надо подержать.
+    @Published var isPhoneMoving: Bool = false
 
-    // Фоновый шум комнаты — вычитается из «сырого» значения после калибровки.
+    // MARK: Внутреннее состояние (только на motionQueue!)
+
     private var backgroundNoise: Double = 0.0
-
-    // Последний «сырой» модуль вектора (без вычитания фона, без сглаживания).
-    // Нужен для калибровки, чтобы взять актуальное значение.
     private var lastRawMagnitude: Double = 0.0
-
-    // Накопитель Low-Pass Filter (по формуле new*α + old*(1-α)).
     private var filteredMagnitude: Double = 0.0
 
-    // Коэффициент LPF — чем меньше, тем сильнее сглаживание.
-    // 0.15 → новое значение даёт 15% веса, старое 85%.
+    // Коэффициент Low-Pass Filter: new*α + old*(1-α). Чем меньше — тем плавнее.
     private let lpfAlpha: Double = 0.15
 
-    // Скользящее окно последних «сырых» замеров — для расчёта AC-амплитуды.
+    // Скользящее окно «сырых» замеров — для расчёта AC-амплитуды.
     private var sampleWindow: [Double] = []
-    private let windowSize = 60   // ≈ 0.6 с при частоте 100 Гц
+    private let windowSize = 60   // ≈ 0.6 с при 100 Гц
 
-    // CoreMotion
+    // Порог пользовательского ускорения (в g), выше которого считаем,
+    // что телефон активно двигается. 1 g ≈ 9.81 м/с². 0.06 g — спокойное
+    // удержание в руке с лёгким дрожанием.
+    private let motionThreshold: Double = 0.06
+
+    // MARK: CoreMotion
+
     private let motionManager = CMMotionManager()
-    private let motionQueue = OperationQueue()
+    private let motionQueue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "com.metaldetector.motionQueue"
+        q.maxConcurrentOperationCount = 1   // строгая сериализация
+        q.qualityOfService = .userInteractive
+        return q
+    }()
 
-    // Тактильная отдача
+    // MARK: Тактильная отдача
+
     private let hapticGenerator = UIImpactFeedbackGenerator(style: .heavy)
     private var lastHapticTime: Date = .distantPast
     private let metalHapticThreshold: Double = 100.0
@@ -96,9 +109,13 @@ final class MagnetometerManager: ObservableObject {
     // MARK: Инициализация
 
     init() {
-        // Device Motion требует и магнитометра, и гироскопа.
-        guard motionManager.isDeviceMotionAvailable,
-              motionManager.isMagnetometerAvailable else {
+        // Проверка: устройство в принципе поддерживает нужный референс-фрейм.
+        // .xArbitraryCorrectedZVertical требует магнитометра + гироскопа;
+        // если его нет в наборе — Device Motion не запустится корректно.
+        let supportedFrames = CMMotionManager.availableAttitudeReferenceFrames()
+        let hasRequiredFrame = supportedFrames.contains(.xArbitraryCorrectedZVertical)
+
+        guard motionManager.isDeviceMotionAvailable, hasRequiredFrame else {
             self.isAvailable = false
             return
         }
@@ -106,7 +123,6 @@ final class MagnetometerManager: ObservableObject {
         // 100 Гц — чтобы успевать ловить колебания поля 50/60 Гц от сети.
         motionManager.deviceMotionUpdateInterval = 0.01
 
-        // Подготовка генератора вибрации
         hapticGenerator.prepare()
     }
 
@@ -117,13 +133,7 @@ final class MagnetometerManager: ObservableObject {
     // вращения самого телефона компенсируются, остаются только реальные
     // изменения внешнего поля.
     func startUpdates() {
-        guard motionManager.isDeviceMotionAvailable,
-              motionManager.isMagnetometerAvailable else {
-            self.isAvailable = false
-            return
-        }
-
-        // Если уже запущено — выходим, чтобы не плодить обработчики.
+        guard isAvailable else { return }
         guard !motionManager.isDeviceMotionActive else { return }
 
         motionManager.startDeviceMotionUpdates(
@@ -135,73 +145,102 @@ final class MagnetometerManager: ObservableObject {
         }
     }
 
-    // Останавливаем датчик и сбрасываем накопленное состояние,
-    // чтобы при следующем запуске не было «всплеска» от старых данных.
+    // Останавливаем датчик и сбрасываем накопленное состояние.
+    // Сброс делаем в motionQueue, чтобы не было гонок с активными колбэками.
     func stopUpdates() {
         if motionManager.isDeviceMotionActive {
             motionManager.stopDeviceMotionUpdates()
         }
-        sampleWindow.removeAll(keepingCapacity: true)
-        filteredMagnitude = 0.0
-        lastRawMagnitude = 0.0
+        motionQueue.addOperation { [weak self] in
+            guard let self = self else { return }
+            self.sampleWindow.removeAll(keepingCapacity: true)
+            self.filteredMagnitude = 0.0
+            self.lastRawMagnitude = 0.0
+        }
     }
 
     // MARK: Калибровка фона (тарирование)
 
     // Запоминает текущее «сырое» значение как фоновый шум комнаты.
-    // Дальше из всех замеров это значение вычитается.
+    // Дальше из всех замеров оно вычитается.
+    // Все операции над внутренним состоянием уходят в motionQueue, чтобы
+    // избежать гонки данных.
     func calibrate() {
-        backgroundNoise = lastRawMagnitude
-
-        // Сразу обнуляем UI-значение и фильтр, чтобы стрелка прыгнула в ноль.
-        DispatchQueue.main.async {
+        motionQueue.addOperation { [weak self] in
+            guard let self = self else { return }
+            self.backgroundNoise = self.lastRawMagnitude
             self.filteredMagnitude = 0.0
-            self.magneticFieldStrength = 0.0
+
+            DispatchQueue.main.async {
+                self.magneticFieldStrength = 0.0
+            }
         }
     }
 
-    // Сброс калибровки (если потребуется)
+    // Сброс калибровки
     func resetCalibration() {
-        backgroundNoise = 0.0
+        motionQueue.addOperation { [weak self] in
+            self?.backgroundNoise = 0.0
+        }
     }
 
     // MARK: Обработка одного замера
 
     private func process(motion: CMDeviceMotion) {
         let calibratedField = motion.magneticField
-        let field = calibratedField.field
 
         // 1. Модуль вектора магнитного поля
+        let field = calibratedField.field
         let rawMagnitude = sqrt(field.x * field.x + field.y * field.y + field.z * field.z)
         lastRawMagnitude = rawMagnitude
 
-        // 2. Окно сырых замеров — для AC-режима.
-        //    Для переменной составляющей сглаживать НЕЛЬЗЯ: фильтр стёр бы
-        //    те самые колебания, которые мы и пытаемся найти.
-        sampleWindow.append(rawMagnitude)
-        if sampleWindow.count > windowSize {
-            sampleWindow.removeFirst(sampleWindow.count - windowSize)
-        }
-        let acValue = sampleWindow.count >= 10
-            ? computeAcAmplitude(samples: sampleWindow)
-            : 0.0
+        // 2. Оценка собственного движения телефона.
+        //    userAcceleration уже без гравитации (в g).
+        //    Если телефоном активно двигают — окно AC-замеров «загрязняется»
+        //    реальными перемещениями в неоднородном поле Земли, и AC даёт
+        //    ложные срабатывания.
+        let ua = motion.userAcceleration
+        let userAccMagnitude = sqrt(ua.x * ua.x + ua.y * ua.y + ua.z * ua.z)
+        let phoneIsMoving = userAccMagnitude > motionThreshold
 
-        // 3. DC-составляющая: вычитаем фон → пропускаем через LPF.
+        // 3. AC-режим: накапливаем только когда телефон неподвижен.
+        //    При движении окно сбрасываем — иначе старые «загрязнённые»
+        //    отсчёты продолжат портить дисперсию.
+        let acValue: Double
+        if phoneIsMoving {
+            sampleWindow.removeAll(keepingCapacity: true)
+            acValue = 0.0
+        } else {
+            sampleWindow.append(rawMagnitude)
+            if sampleWindow.count > windowSize {
+                sampleWindow.removeFirst(sampleWindow.count - windowSize)
+            }
+            acValue = sampleWindow.count >= 10
+                ? computeAcAmplitude(samples: sampleWindow)
+                : 0.0
+        }
+
+        // 4. DC-составляющая: вычитаем фон → пропускаем через LPF.
+        //    Сглаживание убирает микро-дрожание от внутренних токов и
+        //    нагрева процессора, но движение по стене (для поиска металла)
+        //    при этом не теряется — LPF лишь делает реакцию плавной.
         let backgroundCorrected = max(0.0, rawMagnitude - backgroundNoise)
         filteredMagnitude = backgroundCorrected * lpfAlpha + filteredMagnitude * (1.0 - lpfAlpha)
         let dcValue = filteredMagnitude
 
-        // 4. Точность калибровки магнитометра — для подсказки в UI.
+        // 5. Точность калибровки магнитометра
         let mappedAccuracy = Self.map(calibratedField.accuracy)
 
-        // 5. Публикуем результат в главном потоке.
+        // 6. Публикация в UI и тактильная отдача — только из главного потока.
         DispatchQueue.main.async {
             self.accuracy = mappedAccuracy
             self.magneticFieldStrength = dcValue
             self.acAmplitude = acValue
+            self.isPhoneMoving = phoneIsMoving
 
-            // При низкой точности значения «случайные» — вибрировать не нужно.
-            if !mappedAccuracy.needsCalibrationHint {
+            // При низкой точности или активном движении значения недостоверны
+            // — вибрировать не нужно.
+            if !mappedAccuracy.needsCalibrationHint && !phoneIsMoving {
                 self.triggerHapticIfNeeded(dc: dcValue, ac: acValue)
             }
         }

@@ -3,7 +3,6 @@ import SwiftUI
 // Главный экран приложения "Metal & Wire Detector"
 struct ContentView: View {
 
-    // Менеджер магнитометра — источник данных
     @StateObject private var magnetometer = MagnetometerManager()
 
     // Фаза жизненного цикла сцены — для остановки датчика в фоне
@@ -11,61 +10,56 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
-            // Тёмный фон для лучшей читаемости
             Color.black.edgesIgnoringSafeArea(.all)
 
             VStack(spacing: 20) {
-                // Заголовок
                 Text("Metal & Wire Detector")
                     .font(.title2)
                     .fontWeight(.bold)
                     .foregroundColor(.white)
                     .padding(.top, 40)
 
-                // Переключатель режимов работы
                 modePicker
 
-                // Подсказка о низкой точности датчика (если применимо)
-                if magnetometer.isAvailable, let hint = magnetometer.accuracy.hintText {
-                    accuracyHintBanner(text: hint)
+                // Баннеры с подсказками — приоритет у проблемы с точностью
+                if magnetometer.isAvailable {
+                    if let hint = magnetometer.accuracy.hintText {
+                        hintBanner(text: hint, icon: "exclamationmark.triangle.fill", color: .yellow)
+                    } else if magnetometer.mode == .liveWire && magnetometer.isPhoneMoving {
+                        hintBanner(text: "Держите телефон неподвижно у стены",
+                                   icon: "hand.raised.fill",
+                                   color: .orange)
+                    }
                 }
 
                 Spacer()
 
-                // Если датчик недоступен — показываем сообщение об ошибке
                 if !magnetometer.isAvailable {
                     Text("Магнитометр недоступен\nна этом устройстве")
                         .font(.headline)
                         .foregroundColor(.red)
                         .multilineTextAlignment(.center)
                 } else {
-                    // Круглый индикатор силы магнитного поля
                     detectorGauge
-
-                    // Текстовый статус (зависит от уровня поля и режима)
                     statusText
                 }
 
                 Spacer()
 
-                // Кнопка калибровки фона (актуальна для режима «Металл»)
                 calibrationButton
                     .padding(.bottom, 40)
             }
             .padding(.horizontal, 20)
         }
         .onAppear {
-            // Запуск опроса датчика при появлении экрана
             magnetometer.startUpdates()
         }
         .onDisappear {
-            // Остановка при уходе с экрана (на случай навигации)
             magnetometer.stopUpdates()
         }
         .onChange(of: scenePhase) { phase in
-            // Энергосбережение: датчик работает только когда приложение активно.
-            // В фоне или при сворачивании опрос на 100 Гц быстро посадит батарею
-            // и нагреет процессор — поэтому останавливаем.
+            // Энергосбережение: 100 Гц на датчике сильно греет процессор и сажает батарею.
+            // В фоне или при сворачивании останавливаем, при активации возобновляем.
             switch phase {
             case .active:
                 magnetometer.startUpdates()
@@ -89,28 +83,29 @@ struct ContentView: View {
         .padding(.horizontal, 4)
     }
 
-    // MARK: - Баннер «низкая точность датчика»
+    // MARK: - Универсальный баннер-подсказка
 
-    private func accuracyHintBanner(text: String) -> some View {
+    private func hintBanner(text: String, icon: String, color: Color) -> some View {
         HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.yellow)
+            Image(systemName: icon)
+                .foregroundColor(color)
             Text(text)
                 .font(.footnote)
                 .foregroundColor(.white)
                 .multilineTextAlignment(.leading)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 10)
         .padding(.horizontal, 14)
-        .background(Color.yellow.opacity(0.15))
+        .background(color.opacity(0.15))
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.yellow.opacity(0.5), lineWidth: 1)
+                .stroke(color.opacity(0.5), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 
-    // MARK: - Текущее значение и шкала для активного режима
+    // MARK: - Текущее значение, шкала и форматирование
 
     private var currentValue: Double {
         switch magnetometer.mode {
@@ -133,6 +128,14 @@ struct ContentView: View {
         }
     }
 
+    // В режиме провода значения мелкие — даём две цифры после запятой.
+    private var valueFormat: String {
+        switch magnetometer.mode {
+        case .metal:    return "%.1f"
+        case .liveWire: return "%.2f"
+        }
+    }
+
     // MARK: - Круглый индикатор
 
     private var detectorGauge: some View {
@@ -150,9 +153,10 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.2), value: currentValue)
 
             VStack(spacing: 4) {
-                Text(String(format: "%.1f", currentValue))
+                Text(String(format: valueFormat, currentValue))
                     .font(.system(size: 56, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
+                    .monospacedDigit()
                 Text(unitLabel)
                     .font(.title3)
                     .foregroundColor(.gray)
@@ -238,7 +242,6 @@ struct ContentView: View {
         .disabled(!calibrationButtonEnabled)
     }
 
-    // Калибровка имеет смысл только в режиме «Металл» и при нормальной точности
     private var calibrationButtonEnabled: Bool {
         magnetometer.isAvailable
             && magnetometer.mode == .metal

@@ -6,21 +6,21 @@ struct ContentView: View {
     // Менеджер магнитометра — источник данных
     @StateObject private var magnetometer = MagnetometerManager()
 
-    // Максимальное значение шкалы (микротесла)
-    private let maxFieldValue: Double = 200.0
-
     var body: some View {
         ZStack {
             // Тёмный фон для лучшей читаемости
             Color.black.edgesIgnoringSafeArea(.all)
 
-            VStack(spacing: 30) {
+            VStack(spacing: 24) {
                 // Заголовок
                 Text("Metal & Wire Detector")
                     .font(.title2)
                     .fontWeight(.bold)
                     .foregroundColor(.white)
                     .padding(.top, 40)
+
+                // Переключатель режимов работы
+                modePicker
 
                 Spacer()
 
@@ -34,13 +34,13 @@ struct ContentView: View {
                     // Круглый индикатор силы магнитного поля
                     detectorGauge
 
-                    // Текстовый статус (зависит от уровня поля)
+                    // Текстовый статус (зависит от уровня поля и режима)
                     statusText
                 }
 
                 Spacer()
 
-                // Кнопка калибровки
+                // Кнопка калибровки (актуальна только для режима «Металл»)
                 calibrationButton
                     .padding(.bottom, 40)
             }
@@ -56,6 +56,44 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Переключатель режимов
+
+    private var modePicker: some View {
+        Picker("Режим", selection: $magnetometer.mode) {
+            ForEach(DetectorMode.allCases) { mode in
+                Text(mode.title).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 4)
+    }
+
+    // MARK: - Текущее значение и шкала для активного режима
+
+    // Значение, отображаемое в круге (зависит от режима)
+    private var currentValue: Double {
+        switch magnetometer.mode {
+        case .metal:    return magnetometer.magneticFieldStrength
+        case .liveWire: return magnetometer.acAmplitude
+        }
+    }
+
+    // Максимум шкалы для нормирования круга
+    private var maxScaleValue: Double {
+        switch magnetometer.mode {
+        case .metal:    return 200.0   // μT
+        case .liveWire: return 10.0    // μT (амплитуда переменной составляющей)
+        }
+    }
+
+    // Пороги (низкий / высокий) для смены цвета и текста
+    private var thresholds: (low: Double, high: Double) {
+        switch magnetometer.mode {
+        case .metal:    return (70.0, 120.0)
+        case .liveWire: return (1.0, 3.0)
+        }
+    }
+
     // MARK: - Круглый индикатор
 
     private var detectorGauge: some View {
@@ -64,22 +102,22 @@ struct ContentView: View {
             Circle()
                 .stroke(Color.gray.opacity(0.3), lineWidth: 20)
 
-            // Заполняющийся круг — отражает текущую силу поля
+            // Заполняющийся круг — отражает текущую величину
             Circle()
-                .trim(from: 0.0, to: CGFloat(min(magnetometer.magneticFieldStrength / maxFieldValue, 1.0)))
+                .trim(from: 0.0, to: CGFloat(min(currentValue / maxScaleValue, 1.0)))
                 .stroke(
                     gaugeColor,
                     style: StrokeStyle(lineWidth: 20, lineCap: .round)
                 )
                 .rotationEffect(.degrees(-90)) // Старт сверху
-                .animation(.easeInOut(duration: 0.2), value: magnetometer.magneticFieldStrength)
+                .animation(.easeInOut(duration: 0.2), value: currentValue)
 
             // Значение в центре круга
             VStack(spacing: 4) {
-                Text(String(format: "%.1f", magnetometer.magneticFieldStrength))
+                Text(String(format: "%.1f", currentValue))
                     .font(.system(size: 56, weight: .bold, design: .rounded))
                     .foregroundColor(.white)
-                Text("μT")
+                Text(unitLabel)
                     .font(.title3)
                     .foregroundColor(.gray)
             }
@@ -87,37 +125,58 @@ struct ContentView: View {
         .frame(width: 260, height: 260)
     }
 
+    // Подпись единиц — μT в обоих режимах, но в проводе это «амплитуда»
+    private var unitLabel: String {
+        switch magnetometer.mode {
+        case .metal:    return "μT"
+        case .liveWire: return "μT (AC)"
+        }
+    }
+
     // MARK: - Цвет шкалы в зависимости от уровня поля
 
     private var gaugeColor: Color {
-        let value = magnetometer.magneticFieldStrength
-        switch value {
-        case ..<70:
-            return .green
-        case 70..<120:
-            return .yellow
-        default:
-            return .red
+        let (low, high) = thresholds
+        switch currentValue {
+        case ..<low:    return .green
+        case low..<high: return .yellow
+        default:        return .red
         }
     }
 
     // MARK: - Текстовый статус
 
     private var statusText: some View {
-        let value = magnetometer.magneticFieldStrength
+        let (low, high) = thresholds
+        let value = currentValue
         let (text, color): (String, Color)
 
-        // Определяем текст и цвет по диапазонам, заданным в ТЗ
-        switch value {
-        case ..<70:
-            text = "Стена чиста / Металл не обнаружен"
-            color = .green
-        case 70..<120:
-            text = "Подозрение на металл/проводку"
-            color = .yellow
-        default:
-            text = "ВНИМАНИЕ! Обнаружен металл или кабель!"
-            color = .red
+        // Определяем текст и цвет по диапазонам, заданным для текущего режима
+        switch magnetometer.mode {
+        case .metal:
+            switch value {
+            case ..<low:
+                text = "Стена чиста / Металл не обнаружен"
+                color = .green
+            case low..<high:
+                text = "Подозрение на металл/проводку"
+                color = .yellow
+            default:
+                text = "ВНИМАНИЕ! Обнаружен металл или кабель!"
+                color = .red
+            }
+        case .liveWire:
+            switch value {
+            case ..<low:
+                text = "Кабелей под напряжением не обнаружено"
+                color = .green
+            case low..<high:
+                text = "Возможен провод под напряжением"
+                color = .yellow
+            default:
+                text = "ВНИМАНИЕ! Кабель под напряжением!"
+                color = .red
+            }
         }
 
         return Text(text)
@@ -136,16 +195,28 @@ struct ContentView: View {
         }) {
             HStack {
                 Image(systemName: "scope")
-                Text("Калибровка")
+                Text(calibrationButtonTitle)
                     .fontWeight(.semibold)
             }
             .foregroundColor(.white)
             .padding(.vertical, 14)
             .padding(.horizontal, 40)
-            .background(Color.blue)
+            .background(calibrationButtonEnabled ? Color.blue : Color.gray)
             .clipShape(Capsule())
         }
-        .disabled(!magnetometer.isAvailable)
+        .disabled(!calibrationButtonEnabled)
+    }
+
+    // Калибровка имеет смысл только в режиме «Металл»
+    private var calibrationButtonEnabled: Bool {
+        magnetometer.isAvailable && magnetometer.mode == .metal
+    }
+
+    private var calibrationButtonTitle: String {
+        switch magnetometer.mode {
+        case .metal:    return "Калибровка"
+        case .liveWire: return "Калибровка не требуется"
+        }
     }
 }
 

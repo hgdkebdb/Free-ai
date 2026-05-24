@@ -3,7 +3,8 @@ import CoreMotion
 import Combine
 import UIKit
 
-// Режим работы детектора
+// MARK: - Режимы работы детектора
+
 enum DetectorMode: String, CaseIterable, Identifiable {
     case metal       // Поиск металла — статическое (постоянное) магнитное поле
     case liveWire    // Поиск проводов под напряжением — переменное поле 50/60 Гц
@@ -18,161 +19,227 @@ enum DetectorMode: String, CaseIterable, Identifiable {
     }
 }
 
-// Менеджер магнитометра — отвечает за получение данных с датчика,
-// расчёт силы магнитного поля (постоянной и переменной составляющих),
-// калибровку и тактильную отдачу.
+// MARK: - Состояние точности датчика (для UI-подсказок)
+
+enum SensorAccuracy: Equatable {
+    case uncalibrated
+    case low
+    case medium
+    case high
+
+    // Нужно ли показать пользователю подсказку «покрутите восьмёркой»
+    var needsCalibrationHint: Bool {
+        self == .uncalibrated || self == .low
+    }
+
+    // Текст подсказки (если нужен)
+    var hintText: String? {
+        guard needsCalibrationHint else { return nil }
+        return "Покрутите телефон восьмёркой для настройки датчика"
+    }
+}
+
+// MARK: - Менеджер магнитометра
+
+// Отвечает за получение данных Device Motion (магнитометр + гироскоп),
+// сглаживание показаний, калибровку фона, расчёт AC-составляющей и
+// тактильную отдачу.
 final class MagnetometerManager: ObservableObject {
 
-    // MARK: - Публикуемые свойства (для UI)
+    // MARK: Публикуемые свойства (для UI)
 
-    // Текущая сила магнитного поля (μT), с учётом калибровки — для режима «Металл»
+    // Сглаженная DC-составляющая поля за вычетом фона — для режима «Металл».
     @Published var magneticFieldStrength: Double = 0.0
 
-    // Амплитуда переменной составляющей поля (μT) — для режима «Провод 220В».
-    // Рассчитывается как стандартное отклонение скользящего окна × √2.
+    // Амплитуда переменной составляющей (μT) — для режима «Провод 220В».
     @Published var acAmplitude: Double = 0.0
 
-    // Текущий режим работы
+    // Текущий режим работы.
     @Published var mode: DetectorMode = .metal
 
-    // Признак того, что датчик недоступен (для отображения ошибки в UI)
+    // Признак того, что датчик в принципе доступен на устройстве.
     @Published var isAvailable: Bool = true
 
-    // MARK: - Внутреннее состояние
+    // Точность калибровки магнитометра, сообщаемая системой.
+    @Published var accuracy: SensorAccuracy = .uncalibrated
 
-    // Сохранённое фоновое значение постоянной составляющей (калибровка)
-    private var calibrationOffset: Double = 0.0
+    // MARK: Внутреннее состояние
 
-    // Скользящее окно последних замеров — для расчёта AC-амплитуды
+    // Фоновый шум комнаты — вычитается из «сырого» значения после калибровки.
+    private var backgroundNoise: Double = 0.0
+
+    // Последний «сырой» модуль вектора (без вычитания фона, без сглаживания).
+    // Нужен для калибровки, чтобы взять актуальное значение.
+    private var lastRawMagnitude: Double = 0.0
+
+    // Накопитель Low-Pass Filter (по формуле new*α + old*(1-α)).
+    private var filteredMagnitude: Double = 0.0
+
+    // Коэффициент LPF — чем меньше, тем сильнее сглаживание.
+    // 0.15 → новое значение даёт 15% веса, старое 85%.
+    private let lpfAlpha: Double = 0.15
+
+    // Скользящее окно последних «сырых» замеров — для расчёта AC-амплитуды.
     private var sampleWindow: [Double] = []
-    private let windowSize = 60   // ≈ 0.6 секунды при частоте 100 Гц — достаточно для оценки колебаний
+    private let windowSize = 60   // ≈ 0.6 с при частоте 100 Гц
 
-    // Менеджер движения из CoreMotion
+    // CoreMotion
     private let motionManager = CMMotionManager()
-
-    // Очередь для обработки данных от датчика
     private let motionQueue = OperationQueue()
 
-    // Генератор тактильной отдачи (вибрация при превышении порога)
+    // Тактильная отдача
     private let hapticGenerator = UIImpactFeedbackGenerator(style: .heavy)
-
-    // Флаг для предотвращения слишком частой вибрации
     private var lastHapticTime: Date = .distantPast
-
-    // Пороги срабатывания вибрации для каждого режима (μT)
     private let metalHapticThreshold: Double = 100.0
     private let wireHapticThreshold: Double = 3.0
 
-    // MARK: - Инициализация
+    // MARK: Инициализация
 
     init() {
-        // Проверка доступности магнитометра на устройстве
-        guard motionManager.isMagnetometerAvailable else {
+        // Device Motion требует и магнитометра, и гироскопа.
+        guard motionManager.isDeviceMotionAvailable,
+              motionManager.isMagnetometerAvailable else {
             self.isAvailable = false
             return
         }
 
-        // Высокая частота опроса — 100 Гц, чтобы уловить колебания 50/60 Гц
-        // (по Найквисту это пограничный случай, но выраженный alias заметен).
-        motionManager.magnetometerUpdateInterval = 0.01
+        // 100 Гц — чтобы успевать ловить колебания поля 50/60 Гц от сети.
+        motionManager.deviceMotionUpdateInterval = 0.01
 
-        // Предварительная подготовка генератора вибрации (снижает задержку)
+        // Подготовка генератора вибрации
         hapticGenerator.prepare()
     }
 
-    // MARK: - Управление обновлениями
+    // MARK: Управление обновлениями
 
-    // Запуск считывания данных с магнитометра
+    // Запуск Device Motion с привязкой опорной системы координат к вертикали.
+    // .xArbitraryCorrectedZVertical использует и магнитометр, и гироскоп —
+    // вращения самого телефона компенсируются, остаются только реальные
+    // изменения внешнего поля.
     func startUpdates() {
-        guard motionManager.isMagnetometerAvailable else {
+        guard motionManager.isDeviceMotionAvailable,
+              motionManager.isMagnetometerAvailable else {
             self.isAvailable = false
             return
         }
 
-        motionManager.startMagnetometerUpdates(to: motionQueue) { [weak self] data, error in
-            guard let self = self, let field = data?.magneticField, error == nil else { return }
+        // Если уже запущено — выходим, чтобы не плодить обработчики.
+        guard !motionManager.isDeviceMotionActive else { return }
 
-            // Расчёт общей силы магнитного поля по формуле вектора
-            let rawMagnitude = sqrt(field.x * field.x + field.y * field.y + field.z * field.z)
-
-            // Добавляем в скользящее окно и подрезаем до размера
-            self.sampleWindow.append(rawMagnitude)
-            if self.sampleWindow.count > self.windowSize {
-                self.sampleWindow.removeFirst(self.sampleWindow.count - self.windowSize)
-            }
-
-            // Постоянная составляющая (DC) — для режима «Металл»
-            let dcCalibrated = max(0.0, rawMagnitude - self.calibrationOffset)
-
-            // Переменная составляющая (AC) — для режима «Провод 220В».
-            // Если в окне ещё мало данных, считаем 0.
-            let acValue = self.sampleWindow.count >= 10
-                ? self.computeAcAmplitude(samples: self.sampleWindow)
-                : 0.0
-
-            // Обновление публикуемых значений в главном потоке (для UI)
-            DispatchQueue.main.async {
-                self.magneticFieldStrength = dcCalibrated
-                self.acAmplitude = acValue
-                self.triggerHapticIfNeeded(dc: dcCalibrated, ac: acValue)
-            }
+        motionManager.startDeviceMotionUpdates(
+            using: .xArbitraryCorrectedZVertical,
+            to: motionQueue
+        ) { [weak self] motion, error in
+            guard let self = self, let motion = motion, error == nil else { return }
+            self.process(motion: motion)
         }
     }
 
-    // Остановка считывания
+    // Останавливаем датчик и сбрасываем накопленное состояние,
+    // чтобы при следующем запуске не было «всплеска» от старых данных.
     func stopUpdates() {
-        if motionManager.isMagnetometerActive {
-            motionManager.stopMagnetometerUpdates()
+        if motionManager.isDeviceMotionActive {
+            motionManager.stopDeviceMotionUpdates()
         }
+        sampleWindow.removeAll(keepingCapacity: true)
+        filteredMagnitude = 0.0
+        lastRawMagnitude = 0.0
     }
 
-    // MARK: - Калибровка
+    // MARK: Калибровка фона (тарирование)
 
-    // Калибровка — запомнить текущее значение как фоновое (только для DC).
-    // Для AC-режима калибровка не нужна: переменная составляющая по природе
-    // около нуля при отсутствии источника.
+    // Запоминает текущее «сырое» значение как фоновый шум комнаты.
+    // Дальше из всех замеров это значение вычитается.
     func calibrate() {
-        // Берём «сырое» значение в момент калибровки
-        let currentRaw = magneticFieldStrength + calibrationOffset
-        calibrationOffset = currentRaw
+        backgroundNoise = lastRawMagnitude
 
+        // Сразу обнуляем UI-значение и фильтр, чтобы стрелка прыгнула в ноль.
         DispatchQueue.main.async {
+            self.filteredMagnitude = 0.0
             self.magneticFieldStrength = 0.0
         }
     }
 
-    // Сброс калибровки
+    // Сброс калибровки (если потребуется)
     func resetCalibration() {
-        calibrationOffset = 0.0
+        backgroundNoise = 0.0
     }
 
-    // MARK: - Расчёт AC-амплитуды
+    // MARK: Обработка одного замера
+
+    private func process(motion: CMDeviceMotion) {
+        let calibratedField = motion.magneticField
+        let field = calibratedField.field
+
+        // 1. Модуль вектора магнитного поля
+        let rawMagnitude = sqrt(field.x * field.x + field.y * field.y + field.z * field.z)
+        lastRawMagnitude = rawMagnitude
+
+        // 2. Окно сырых замеров — для AC-режима.
+        //    Для переменной составляющей сглаживать НЕЛЬЗЯ: фильтр стёр бы
+        //    те самые колебания, которые мы и пытаемся найти.
+        sampleWindow.append(rawMagnitude)
+        if sampleWindow.count > windowSize {
+            sampleWindow.removeFirst(sampleWindow.count - windowSize)
+        }
+        let acValue = sampleWindow.count >= 10
+            ? computeAcAmplitude(samples: sampleWindow)
+            : 0.0
+
+        // 3. DC-составляющая: вычитаем фон → пропускаем через LPF.
+        let backgroundCorrected = max(0.0, rawMagnitude - backgroundNoise)
+        filteredMagnitude = backgroundCorrected * lpfAlpha + filteredMagnitude * (1.0 - lpfAlpha)
+        let dcValue = filteredMagnitude
+
+        // 4. Точность калибровки магнитометра — для подсказки в UI.
+        let mappedAccuracy = Self.map(calibratedField.accuracy)
+
+        // 5. Публикуем результат в главном потоке.
+        DispatchQueue.main.async {
+            self.accuracy = mappedAccuracy
+            self.magneticFieldStrength = dcValue
+            self.acAmplitude = acValue
+
+            // При низкой точности значения «случайные» — вибрировать не нужно.
+            if !mappedAccuracy.needsCalibrationHint {
+                self.triggerHapticIfNeeded(dc: dcValue, ac: acValue)
+            }
+        }
+    }
+
+    // Маппинг CMMagneticFieldCalibrationAccuracy в наш enum
+    private static func map(_ raw: CMMagneticFieldCalibrationAccuracy) -> SensorAccuracy {
+        switch raw {
+        case .uncalibrated: return .uncalibrated
+        case .low:          return .low
+        case .medium:       return .medium
+        case .high:         return .high
+        @unknown default:   return .low
+        }
+    }
+
+    // MARK: AC-амплитуда
 
     // Стандартное отклонение окна × √2 ≈ амплитуда синусоиды.
     // У постоянного поля разброс маленький → AC ≈ 0.
-    // У переменного поля (рядом с проводом 220В) разброс растёт.
+    // Рядом с проводом 220В разброс растёт.
     private func computeAcAmplitude(samples: [Double]) -> Double {
         let n = Double(samples.count)
         let mean = samples.reduce(0, +) / n
         let variance = samples.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / n
-        let stdDev = sqrt(variance)
-        return stdDev * sqrt(2.0)
+        return sqrt(variance) * sqrt(2.0)
     }
 
-    // MARK: - Тактильная отдача
+    // MARK: Тактильная отдача
 
-    // Вибрация при превышении порога — пороги разные для каждого режима.
     private func triggerHapticIfNeeded(dc: Double, ac: Double) {
         let exceeded: Bool
         switch mode {
-        case .metal:
-            exceeded = dc > metalHapticThreshold
-        case .liveWire:
-            exceeded = ac > wireHapticThreshold
+        case .metal:    exceeded = dc > metalHapticThreshold
+        case .liveWire: exceeded = ac > wireHapticThreshold
         }
         guard exceeded else { return }
 
-        // Не чаще одной вибрации в 0.3 секунды
         let now = Date()
         if now.timeIntervalSince(lastHapticTime) > 0.3 {
             hapticGenerator.impactOccurred()

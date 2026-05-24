@@ -6,12 +6,15 @@ struct ContentView: View {
     // Менеджер магнитометра — источник данных
     @StateObject private var magnetometer = MagnetometerManager()
 
+    // Фаза жизненного цикла сцены — для остановки датчика в фоне
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some View {
         ZStack {
             // Тёмный фон для лучшей читаемости
             Color.black.edgesIgnoringSafeArea(.all)
 
-            VStack(spacing: 24) {
+            VStack(spacing: 20) {
                 // Заголовок
                 Text("Metal & Wire Detector")
                     .font(.title2)
@@ -21,6 +24,11 @@ struct ContentView: View {
 
                 // Переключатель режимов работы
                 modePicker
+
+                // Подсказка о низкой точности датчика (если применимо)
+                if magnetometer.isAvailable, let hint = magnetometer.accuracy.hintText {
+                    accuracyHintBanner(text: hint)
+                }
 
                 Spacer()
 
@@ -40,7 +48,7 @@ struct ContentView: View {
 
                 Spacer()
 
-                // Кнопка калибровки (актуальна только для режима «Металл»)
+                // Кнопка калибровки фона (актуальна для режима «Металл»)
                 calibrationButton
                     .padding(.bottom, 40)
             }
@@ -51,8 +59,21 @@ struct ContentView: View {
             magnetometer.startUpdates()
         }
         .onDisappear {
-            // Остановка опроса при уходе с экрана (экономия батареи)
+            // Остановка при уходе с экрана (на случай навигации)
             magnetometer.stopUpdates()
+        }
+        .onChange(of: scenePhase) { phase in
+            // Энергосбережение: датчик работает только когда приложение активно.
+            // В фоне или при сворачивании опрос на 100 Гц быстро посадит батарею
+            // и нагреет процессор — поэтому останавливаем.
+            switch phase {
+            case .active:
+                magnetometer.startUpdates()
+            case .inactive, .background:
+                magnetometer.stopUpdates()
+            @unknown default:
+                break
+            }
         }
     }
 
@@ -68,9 +89,29 @@ struct ContentView: View {
         .padding(.horizontal, 4)
     }
 
+    // MARK: - Баннер «низкая точность датчика»
+
+    private func accuracyHintBanner(text: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.yellow)
+            Text(text)
+                .font(.footnote)
+                .foregroundColor(.white)
+                .multilineTextAlignment(.leading)
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 14)
+        .background(Color.yellow.opacity(0.15))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.yellow.opacity(0.5), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
     // MARK: - Текущее значение и шкала для активного режима
 
-    // Значение, отображаемое в круге (зависит от режима)
     private var currentValue: Double {
         switch magnetometer.mode {
         case .metal:    return magnetometer.magneticFieldStrength
@@ -78,15 +119,13 @@ struct ContentView: View {
         }
     }
 
-    // Максимум шкалы для нормирования круга
     private var maxScaleValue: Double {
         switch magnetometer.mode {
-        case .metal:    return 200.0   // μT
-        case .liveWire: return 10.0    // μT (амплитуда переменной составляющей)
+        case .metal:    return 200.0
+        case .liveWire: return 10.0
         }
     }
 
-    // Пороги (низкий / высокий) для смены цвета и текста
     private var thresholds: (low: Double, high: Double) {
         switch magnetometer.mode {
         case .metal:    return (70.0, 120.0)
@@ -98,21 +137,18 @@ struct ContentView: View {
 
     private var detectorGauge: some View {
         ZStack {
-            // Фоновый круг
             Circle()
                 .stroke(Color.gray.opacity(0.3), lineWidth: 20)
 
-            // Заполняющийся круг — отражает текущую величину
             Circle()
                 .trim(from: 0.0, to: CGFloat(min(currentValue / maxScaleValue, 1.0)))
                 .stroke(
                     gaugeColor,
                     style: StrokeStyle(lineWidth: 20, lineCap: .round)
                 )
-                .rotationEffect(.degrees(-90)) // Старт сверху
+                .rotationEffect(.degrees(-90))
                 .animation(.easeInOut(duration: 0.2), value: currentValue)
 
-            // Значение в центре круга
             VStack(spacing: 4) {
                 Text(String(format: "%.1f", currentValue))
                     .font(.system(size: 56, weight: .bold, design: .rounded))
@@ -125,7 +161,6 @@ struct ContentView: View {
         .frame(width: 260, height: 260)
     }
 
-    // Подпись единиц — μT в обоих режимах, но в проводе это «амплитуда»
     private var unitLabel: String {
         switch magnetometer.mode {
         case .metal:    return "μT"
@@ -133,14 +168,12 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Цвет шкалы в зависимости от уровня поля
-
     private var gaugeColor: Color {
         let (low, high) = thresholds
         switch currentValue {
-        case ..<low:    return .green
+        case ..<low:     return .green
         case low..<high: return .yellow
-        default:        return .red
+        default:         return .red
         }
     }
 
@@ -151,7 +184,6 @@ struct ContentView: View {
         let value = currentValue
         let (text, color): (String, Color)
 
-        // Определяем текст и цвет по диапазонам, заданным для текущего режима
         switch magnetometer.mode {
         case .metal:
             switch value {
@@ -186,11 +218,10 @@ struct ContentView: View {
             .padding(.horizontal, 16)
     }
 
-    // MARK: - Кнопка калибровки
+    // MARK: - Кнопка калибровки фона
 
     private var calibrationButton: some View {
         Button(action: {
-            // Сохраняем текущее значение как фон
             magnetometer.calibrate()
         }) {
             HStack {
@@ -207,14 +238,16 @@ struct ContentView: View {
         .disabled(!calibrationButtonEnabled)
     }
 
-    // Калибровка имеет смысл только в режиме «Металл»
+    // Калибровка имеет смысл только в режиме «Металл» и при нормальной точности
     private var calibrationButtonEnabled: Bool {
-        magnetometer.isAvailable && magnetometer.mode == .metal
+        magnetometer.isAvailable
+            && magnetometer.mode == .metal
+            && !magnetometer.accuracy.needsCalibrationHint
     }
 
     private var calibrationButtonTitle: String {
         switch magnetometer.mode {
-        case .metal:    return "Калибровка"
+        case .metal:    return "Калибровка фона"
         case .liveWire: return "Калибровка не требуется"
         }
     }

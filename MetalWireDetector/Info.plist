@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Имя приложения, отображаемое на главном экране и в настройках.
+    -->
+    <key>CFBundleDisplayName</key>
+    <string>Metal Detector</string>
+
+    <key>CFBundleName</key>
+    <string>MetalWireDetector</string>
+
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+
+    <!--
+        ⚠️ ОБЯЗАТЕЛЬНАЯ строка для доступа к датчикам движения
+        (включая магнитометр через CoreMotion).
+        Без неё приложение не сможет получить данные с датчика и при первом
+        запросе iOS сразу откажет в доступе.
+    -->
+    <key>NSMotionUsageDescription</key>
+    <string>Приложению нужен доступ к датчикам движения, чтобы измерять магнитное поле и обнаруживать металл и электропроводку в стенах.</string>
+
+    <!--
+        Поддерживаемые ориентации устройства (только портретная,
+        чтобы круглый индикатор всегда был по центру).
+    -->
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+
+    <!--
+        Сцена SwiftUI / запуск через UIApplicationSceneManifest.
+    -->
+    <key>UIApplicationSceneManifest</key>
+    <dict>
+        <key>UIApplicationSupportsMultipleScenes</key>
+        <false/>
+    </dict>
+
+    <!--
+        Стиль строки состояния — светлая, потому что фон у нас тёмный.
+    -->
+    <key>UIStatusBarStyle</key>
+    <string>UIStatusBarStyleLightContent</string>
+
+    <key>UIViewControllerBasedStatusBarAppearance</key>
+    <false/>
+</dict>
+</plist>
